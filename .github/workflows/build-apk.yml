@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Run unit tests (parsers)
-        run: ./gradlew :app:testReleaseUnitTest --no-daemon
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
 
       - name: Build Release APK
         env:
