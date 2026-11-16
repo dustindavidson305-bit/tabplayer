@@ -4,25 +4,47 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.math.abs
+import kotlin.math.sign
 import kotlin.math.tanh
 
 /**
  * Streaming playback engine: schedules the selected track's notes through
  * the software synth and mixes them into an AudioTrack. Position is
  * published as a StateFlow of ticks for the playhead.
+ *
+ * v1.1: per-note technique shaping (bends, slides, palm mutes, harmonics,
+ * vibrato, hammer-ons), a practice loop over a selected bar range, and a
+ * tempo trainer that raises the speed by a set % after each loop pass.
+ * The mixer uses a soft-knee limiter that is linear below 0.75 instead of
+ * v1.0's always-on tanh squash (a major cause of the "everything sounds
+ * distorted" complaint, together with the old synth).
  */
 class PlayerEngine {
 
     val positionTicks = MutableStateFlow(0L)
     val isPlaying = MutableStateFlow(false)
+    /** Current trainer speed in % of the slider tempo (100 when trainer is off). */
+    val speedPct = MutableStateFlow(100)
+    /** Completed loop passes since playback started. */
+    val loopPass = MutableStateFlow(0)
 
     @Volatile var bpm: Int = 120
     @Volatile var loop: Boolean = false
+    @Volatile var loopStartTick: Long = 0L
+    @Volatile var loopEndTick: Long = -1L // -1 = end of song
+    @Volatile var trainerEnabled: Boolean = false
+    @Volatile var trainerStartPct: Int = 50
+    @Volatile var trainerStepPct: Int = 5
+    @Volatile var trainerCapPct: Int = 100
+
+    @Volatile private var currentPct: Int = 100
     @Volatile private var family: SoundFamily = SoundFamily.GUITAR
     @Volatile private var variant: Int = 0
 
     private var song: SongData? = null
     private var events: List<NoteEvent> = emptyList()
+    private var eventFx: List<Synth.FxSpec> = emptyList()
     private var totalTicks: Long = 0
 
     @Volatile private var posTicks: Double = 0.0
@@ -37,14 +59,73 @@ class PlayerEngine {
         this.family = family
         this.variant = variant
         val track = song.tracks.getOrNull(trackIndex)
-        events = track?.notes?.filter { !it.tie }?.sortedBy { it.startTick } ?: emptyList()
+        val playable = track?.notes?.filter { !it.tie }?.sortedBy { it.startTick } ?: emptyList()
+        events = playable
+        eventFx = buildFx(playable)
         totalTicks = song.totalTicks
         if (posTicks > totalTicks) seekTo(0)
+    }
+
+    /**
+     * Translate each note's techniques into synth shaping, resolving the
+     * ones that depend on neighbouring notes (slide targets, legato
+     * hammer-ons, let-ring sustain into the next note on the string).
+     */
+    internal fun buildFx(notes: List<NoteEvent>): List<Synth.FxSpec> {
+        fun nextOnString(i: Int): Int? {
+            val n = notes[i]
+            if (n.string == 0) return null
+            for (j in i + 1 until notes.size) {
+                if (notes[j].string == n.string && notes[j].startTick > n.startTick) return j
+            }
+            return null
+        }
+        return notes.mapIndexed { i, n ->
+            val e = n.effects
+            var slideTo = 0f
+            if (e.slideOut) {
+                slideTo = when (e.slideType) {
+                    3 -> -3f // slide out downwards: fall away from the note
+                    4 -> 3f  // slide out upwards: rise away from the note
+                    else -> { // shift / legato: glide into the next note's pitch
+                        val j = nextOnString(i)
+                        if (j != null) (notes[j].pitch - n.pitch).toFloat() else 0f
+                    }
+                }
+            }
+            val slideFrom = when (e.slideType) {
+                -1 -> -2f // slide into from below: start 2 semitones under, glide up
+                -2 -> 2f  // slide into from above: start 2 semitones over, glide down
+                else -> 0f
+            }
+            // A hammer-on/pull-off target (or a legato-slide target) is not re-picked.
+            val soft = e.hammerPull || (i > 0 && notes[i - 1].string == n.string &&
+                notes[i - 1].effects.slideType == 2)
+            Synth.FxSpec(
+                palmMute = e.palmMute,
+                harmonic = e.isHarmonic,
+                bendSemitones = e.bendSemitones,
+                bendRelease = e.bendType in intArrayOf(2, 3, 5),
+                prebend = e.bendType in intArrayOf(4, 5),
+                slideFromSemitones = slideFrom,
+                slideToSemitones = slideTo,
+                vibrato = e.vibrato,
+                staccato = e.staccato,
+                softAttack = soft,
+            )
+        }
     }
 
     fun setSound(family: SoundFamily, variant: Int) {
         this.family = family
         this.variant = variant
+    }
+
+    /** Called when trainer settings change: restart the ramp from the start %. */
+    fun resetTrainer() {
+        currentPct = if (trainerEnabled) trainerStartPct else 100
+        speedPct.value = currentPct
+        loopPass.value = 0
     }
 
     fun seekTo(tick: Long) {
@@ -55,7 +136,11 @@ class PlayerEngine {
     fun play() {
         if (running) return
         if (totalTicks == 0L) return
+        if (loop && loopEndTick > 0 && (posTicks < loopStartTick || posTicks >= loopEndTick)) {
+            seekTo(loopStartTick)
+        }
         if (posTicks >= totalTicks) seekTo(0)
+        if (posTicks <= loopStartTick + 1) resetTrainer()
         val sr = Synth.SAMPLE_RATE
         val minBuf = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val at = AudioTrack.Builder()
@@ -102,7 +187,8 @@ class PlayerEngine {
         val s = song ?: return bpm * PPQ / 60.0
         val fileBpm = s.bpmAt(tick)
         val effective = bpm * (fileBpm.toDouble() / s.tempoBpm.coerceAtLeast(1))
-        return effective * PPQ / 60.0
+        val scale = if (trainerEnabled) currentPct / 100.0 else 1.0
+        return effective * scale * PPQ / 60.0
     }
 
     private fun renderLoop(at: AudioTrack) {
@@ -125,9 +211,22 @@ class PlayerEngine {
                 if (ev.startTick >= blockStart - 0.001) {
                     val offset = (((ev.startTick - blockStart) / blockTicks) * blockFrames).toInt()
                         .coerceIn(0, blockFrames - 1)
-                    val durSec = (ev.durationTicks / tps).coerceIn(0.05, 6.0)
+                    var durSec = (ev.durationTicks / tps).coerceIn(0.05, 6.0)
+                    if (ev.effects.letRing) {
+                        // Sustain toward the next note on the same string.
+                        val nextStart = events.drop(eventIndex + 1)
+                            .firstOrNull { it.string == ev.string && it.startTick > ev.startTick }
+                            ?.startTick
+                        if (nextStart != null) {
+                            val gapSec = ((nextStart - ev.startTick) / tps).coerceIn(0.0, 6.0)
+                            durSec = maxOf(durSec, minOf(gapSec * 0.95, 6.0))
+                        } else {
+                            durSec = minOf(durSec * 2, 6.0)
+                        }
+                    }
                     val samples = try {
-                        Synth.renderNote(family, variant, ev.pitch, ev.velocity, durSec, ev.dead)
+                        Synth.renderNote(family, variant, ev.pitch, ev.velocity, durSec, ev.dead,
+                            eventFx.getOrElse(eventIndex) { Synth.FxSpec() })
                     } catch (e: Exception) {
                         null
                     }
@@ -138,24 +237,21 @@ class PlayerEngine {
                 eventIndex++
             }
 
-            // Mix.
+            // Mix with a soft-knee limiter (linear below 0.75, gentle above).
             for (f in 0 until blockFrames) {
                 var sum = 0f
-                val it = voices.iterator()
-                while (it.hasNext()) {
-                    val v = it.next()
-                    if (f >= v.startFrame) {
-                        if (v.cursor < v.samples.size) {
-                            sum += v.samples[v.cursor]
-                            v.cursor++
-                        }
-                        if (v.cursor >= v.samples.size && f >= v.startFrame) {
-                            // mark for removal below (can't remove mid-frame safely for other voices)
-                        }
+                for (vi in voices.indices) {
+                    val v = voices[vi]
+                    if (f >= v.startFrame && v.cursor < v.samples.size) {
+                        sum += v.samples[v.cursor]
+                        v.cursor++
                     }
                 }
-                val clipped = tanh(sum.toDouble() * 0.9).toFloat()
-                out[f] = (clipped * 32767).toInt().toShort()
+                val x = sum * 0.9f
+                val ax = abs(x)
+                val y = if (ax <= 0.75f) x
+                    else sign(x) * (0.75f + 0.25f * tanh(((ax - 0.75f) / 0.25f).toDouble()).toFloat())
+                out[f] = (y * 32767).toInt().toShort()
             }
             voices.removeAll { v -> v.cursor >= v.samples.size }
 
@@ -166,11 +262,19 @@ class PlayerEngine {
             }
 
             posTicks = blockEnd
-            if (posTicks >= totalTicks) {
+            val effEnd = if (loop && loopEndTick > 0) minOf(loopEndTick, totalTicks) else totalTicks
+            if (posTicks >= effEnd) {
                 if (loop) {
-                    posTicks = 0.0
-                    eventIndex = 0
+                    // Wrap to the loop start; a completed pass steps the trainer.
+                    posTicks = (if (loopEndTick > 0) loopStartTick else 0L).toDouble()
+                    eventIndex = events.indexOfFirst { it.startTick >= posTicks }
+                    if (eventIndex < 0) eventIndex = events.size
                     voices.clear()
+                    loopPass.value = loopPass.value + 1
+                    if (trainerEnabled && currentPct < trainerCapPct) {
+                        currentPct = minOf(trainerCapPct, currentPct + trainerStepPct)
+                        speedPct.value = currentPct
+                    }
                 } else {
                     posTicks = totalTicks.toDouble()
                     positionTicks.value = posTicks.toLong()

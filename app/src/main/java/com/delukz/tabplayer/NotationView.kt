@@ -53,9 +53,24 @@ fun ScoreView(
     currentTick: Long,
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    selectedBars: IntRange? = null,
 ) {
     val systems = remember(song, track) {
         song.measures.chunked(2)
+    }
+    // Previous / next note on the same string, by index in track.notes
+    // (drives slide lines and hammer-on/pull-off slurs).
+    val links = remember(track) {
+        val prev = HashMap<Int, Int>()
+        val next = HashMap<Int, Int>()
+        val lastOnString = HashMap<Int, Int>()
+        track.notes.forEachIndexed { i, n ->
+            if (n.string > 0) {
+                lastOnString[n.string]?.let { p -> prev[i] = p; next[p] = i }
+                lastOnString[n.string] = i
+            }
+        }
+        prev to next
     }
     val listState = rememberLazyListState()
     val currentSystem = remember(currentTick, song) {
@@ -80,6 +95,9 @@ fun ScoreView(
                 currentTick = currentTick,
                 currentOnset = currentOnset,
                 onSeek = onSeek,
+                prevOnString = links.first,
+                nextOnString = links.second,
+                selectedBars = selectedBars,
             )
         }
     }
@@ -93,6 +111,9 @@ private fun SystemCanvas(
     currentTick: Long,
     currentOnset: Long,
     onSeek: (Long) -> Unit,
+    prevOnString: Map<Int, Int>,
+    nextOnString: Map<Int, Int>,
+    selectedBars: IntRange?,
 ) {
     val textMeasurer = rememberTextMeasurer()
     val lineColor = Color(0xFF9E9E9E)
@@ -174,8 +195,27 @@ private fun SystemCanvas(
         val bottomStep = if (isBass) 18 else 30 // G2 bass clef / E4 treble clef bottom line
         val transpose = if (track.isPercussion) 0 else 12
 
+        // X position of any tick inside this system (null when outside it).
+        fun xFor(tick: Long): Float? {
+            for ((j, mm) in measures.withIndex()) {
+                if (tick >= mm.startTick && tick < mm.startTick + mm.lengthTicks) {
+                    val f = (tick - mm.startTick).toFloat() / mm.lengthTicks.toFloat()
+                    return leftPad + j * mw + 14.dp.toPx() + f * (mw - 20.dp.toPx())
+                }
+            }
+            return null
+        }
+
         for ((mi, m) in measures.withIndex()) {
             val mx = leftPad + mi * mw
+            // Practice-loop selection shading
+            if (selectedBars != null && m.number in selectedBars) {
+                drawRect(
+                    highlight.copy(alpha = 0.10f),
+                    Offset(mx, staffTop - 16.dp.toPx()),
+                    Size(mw, tabTop + (tabLines - 1) * tabGap + 12.dp.toPx() - (staffTop - 16.dp.toPx())),
+                )
+            }
             // Bar lines
             drawLine(noteColor, Offset(mx, staffTop), Offset(mx, staffBottom), strokeWidth = 1.2.dp.toPx())
             drawLine(noteColor, Offset(mx, tabTop), Offset(mx, tabTop + (tabLines - 1) * tabGap), strokeWidth = 1.2.dp.toPx())
@@ -189,8 +229,9 @@ private fun SystemCanvas(
                 TextStyle(fontSize = 9.sp, color = lineColor)
             )
 
-            val mNotes = track.notes.filter { it.startTick >= m.startTick && it.startTick < m.startTick + m.lengthTicks }
-            for (note in mNotes) {
+            val mNotes = track.notes.withIndex()
+                .filter { it.value.startTick >= m.startTick && it.value.startTick < m.startTick + m.lengthTicks }
+            for ((noteIndex, note) in mNotes) {
                 val frac = (note.startTick - m.startTick).toFloat() / m.lengthTicks.toFloat()
                 val x = mx + 14.dp.toPx() + frac * (mw - 20.dp.toPx())
                 val isCurrent = note.startTick == currentOnset && currentTick >= 0
@@ -248,7 +289,11 @@ private fun SystemCanvas(
                         TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Bold, color = color))
                 } else if (stringCount > 0 && note.string in 1..stringCount) {
                     val ty = tabTop + (note.string - 1) * tabGap
-                    val label = if (note.dead) "x" else note.fret.toString()
+                    val label = when {
+                        note.dead -> "x"
+                        note.effects.harmonicType == 1 -> "<${note.fret}>" // natural harmonic
+                        else -> note.fret.toString()
+                    }
                     val style = TextStyle(fontSize = 11.5.sp, fontWeight = FontWeight.Bold, color = color)
                     val measured = textMeasurer.measure(label, style)
                     drawRect(bg, Offset(x - measured.size.width / 2 - 1.5.dp.toPx(), ty - 7.dp.toPx()),
@@ -259,6 +304,107 @@ private fun SystemCanvas(
                     val label = pitchName(note.pitch)
                     drawText(textMeasurer, label, Offset(x - 8.dp.toPx(), tabTop - 6.dp.toPx()),
                         TextStyle(fontSize = 10.sp, color = color))
+                }
+
+                // --- Technique notations ---
+                val fx = note.effects
+                if (!fx.isPlain && stringCount > 0 && note.string in 1..stringCount) {
+                    val ty = tabTop + (note.string - 1) * tabGap
+                    val prevIdx = prevOnString[noteIndex]
+                    val prevNote = prevIdx?.let { track.notes[it] }
+                    val nextIdx = nextOnString[noteIndex]
+                    val nextNote = nextIdx?.let { track.notes[it] }
+                    val techStyle = TextStyle(fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = color)
+
+                    // Lower annotation row: PM / harmonic kind / vibrato / let ring.
+                    val tags = mutableListOf<String>()
+                    if (fx.palmMute && prevNote?.effects?.palmMute != true) tags.add("PM")
+                    when (fx.harmonicType) {
+                        2 -> tags.add("AH")
+                        3 -> tags.add("TH")
+                        4 -> tags.add("PH")
+                        5 -> tags.add("SH")
+                    }
+                    if (fx.letRing && prevNote?.effects?.letRing != true) tags.add("l.r.")
+                    if (fx.vibrato) tags.add("~")
+                    if (tags.isNotEmpty()) {
+                        drawText(
+                            textMeasurer, tags.joinToString(" "), Offset(x - 6.dp.toPx(), tabTop - 11.dp.toPx()),
+                            techStyle,
+                        )
+                    }
+                    // Palm-mute continuation dashes toward the next muted note.
+                    if (fx.palmMute && nextNote?.effects?.palmMute == true) {
+                        val nx = xFor(nextNote.startTick)
+                        if (nx != null) {
+                            var dx = x + 10.dp.toPx()
+                            while (dx < nx - 8.dp.toPx()) {
+                                drawLine(color, Offset(dx, tabTop - 6.dp.toPx()), Offset(dx + 4.dp.toPx(), tabTop - 6.dp.toPx()), strokeWidth = 1.dp.toPx())
+                                dx += 7.dp.toPx()
+                            }
+                        }
+                    }
+                    // Staccato dot above the staff note head.
+                    if (fx.staccato) {
+                        drawCircle(color, Offset(x, y - 13.dp.toPx()), radius = 1.8.dp.toPx())
+                    }
+                    // Bend: curved arrow above the tab, labelled with the amount.
+                    if (fx.hasBend) {
+                        val bendLabel = when {
+                            fx.bendSemitones >= 1.9f -> "full"
+                            fx.bendSemitones >= 0.9f -> "½"
+                            fx.bendSemitones >= 0.4f -> "¼"
+                            else -> fx.bendSemitones.toString()
+                        }
+                        if (fx.bendType in intArrayOf(4, 5)) {
+                            // Prebend: straight up arrow (note starts already bent).
+                            drawLine(color, Offset(x - 4.dp.toPx(), tabTop - 12.dp.toPx()), Offset(x - 4.dp.toPx(), tabTop - 26.dp.toPx()), strokeWidth = 1.3.dp.toPx())
+                            drawLine(color, Offset(x - 7.dp.toPx(), tabTop - 22.dp.toPx()), Offset(x - 4.dp.toPx(), tabTop - 27.dp.toPx()), strokeWidth = 1.3.dp.toPx())
+                            drawLine(color, Offset(x - 1.dp.toPx(), tabTop - 22.dp.toPx()), Offset(x - 4.dp.toPx(), tabTop - 27.dp.toPx()), strokeWidth = 1.3.dp.toPx())
+                        } else {
+                            val path = androidx.compose.ui.graphics.Path().apply {
+                                moveTo(x, tabTop - 12.dp.toPx())
+                                quadraticBezierTo(x + 9.dp.toPx(), tabTop - 27.dp.toPx(), x + 17.dp.toPx(), tabTop - 23.dp.toPx())
+                            }
+                            drawPath(path, color, style = Stroke(width = 1.3.dp.toPx()))
+                            drawLine(color, Offset(x + 12.dp.toPx(), tabTop - 24.dp.toPx()), Offset(x + 18.dp.toPx(), tabTop - 24.dp.toPx()), strokeWidth = 1.3.dp.toPx())
+                            drawLine(color, Offset(x + 16.dp.toPx(), tabTop - 28.dp.toPx()), Offset(x + 18.dp.toPx(), tabTop - 23.dp.toPx()), strokeWidth = 1.3.dp.toPx())
+                        }
+                        drawText(textMeasurer, bendLabel, Offset(x + 3.dp.toPx(), tabTop - 33.dp.toPx()), techStyle)
+                    }
+                    // Slides drawn on the tab line.
+                    if (fx.slideOut) {
+                        val nx = nextNote?.let { xFor(it.startTick) }
+                        if (nx != null && nextNote != null) {
+                            val nty = tabTop + (nextNote.string - 1) * tabGap
+                            drawLine(color, Offset(x + 8.dp.toPx(), ty), Offset(nx - 8.dp.toPx(), nty), strokeWidth = 1.2.dp.toPx())
+                        } else {
+                            val dy = if (fx.slideType == 3) 6.dp.toPx() else -6.dp.toPx()
+                            drawLine(color, Offset(x + 8.dp.toPx(), ty), Offset(x + 22.dp.toPx(), ty + dy), strokeWidth = 1.2.dp.toPx())
+                        }
+                    }
+                    if (fx.slideIn) {
+                        val dy = if (fx.slideType == -1) 7.dp.toPx() else -7.dp.toPx()
+                        drawLine(color, Offset(x - 21.dp.toPx(), ty + dy), Offset(x - 7.dp.toPx(), ty), strokeWidth = 1.2.dp.toPx())
+                    }
+                    // Hammer-on / pull-off: slur arc from the previous note + H/P.
+                    if (fx.hammerPull && prevNote != null) {
+                        val px = xFor(prevNote.startTick)
+                        if (px != null) {
+                            val pty = tabTop + (prevNote.string - 1) * tabGap
+                            val path = androidx.compose.ui.graphics.Path().apply {
+                                moveTo(px, pty - 10.dp.toPx())
+                                quadraticBezierTo((px + x) / 2, tabTop - 24.dp.toPx(), x, ty - 10.dp.toPx())
+                            }
+                            drawPath(path, color, style = Stroke(width = 1.1.dp.toPx()))
+                            val letter = if (note.pitch < prevNote.pitch) "P" else "H"
+                            drawText(
+                                textMeasurer, letter,
+                                Offset((px + x) / 2 - 3.dp.toPx(), tabTop - 25.dp.toPx()),
+                                techStyle,
+                            )
+                        }
+                    }
                 }
             }
 

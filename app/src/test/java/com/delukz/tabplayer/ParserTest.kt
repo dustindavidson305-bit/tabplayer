@@ -195,4 +195,94 @@ class ParserTest {
             assertTrue("drum $pitch renders", buf.isNotEmpty())
         }
     }
+
+    @Test
+    fun gp5EffectsFixture() {
+        val song = GpParser.parse(resource("effects_fixture.gp5"))
+        assertEquals("TabPlayer FX Fixture", song.title)
+        assertEquals(3, song.measures.size)
+        val notes = song.tracks[0].notes.sortedBy { it.startTick }
+        assertEquals(10, notes.size)
+        fun at(tick: Long) = notes.first { it.startTick == tick }
+        // Measure 1
+        at(0).let {
+            assertEquals(2.0f, it.effects.bendSemitones, 0.01f)
+            assertEquals(1, it.effects.bendType)
+        }
+        at(480).let { assertEquals(1, it.effects.slideType) }
+        at(960).let {
+            assertTrue(it.effects.hammerPull)
+            assertTrue(it.effects.palmMute)
+        }
+        at(1440).let { assertEquals(1, it.effects.harmonicType) }
+        // Measure 2
+        at(1920).let {
+            assertTrue(it.effects.letRing)
+            assertTrue(it.effects.vibrato)
+        }
+        at(2400).let { assertTrue(it.dead) } // dead note (type 3)
+        at(2880).let {
+            assertEquals(4, it.effects.harmonicType) // pinch harmonic
+            assertTrue(it.effects.staccato)
+        }
+        at(3360).let {
+            assertEquals(1.0f, it.effects.bendSemitones, 0.01f)
+            assertEquals(5, it.effects.bendType) // prebend + release
+        }
+        // Measure 3: GP5 stores slide flags as a bitmask, not the signed type
+        at(3840).let { assertEquals(-2, it.effects.slideType) } // mask 0x20 = into from above
+        at(4320).let { assertEquals(3, it.effects.slideType) } // mask 0x04 = out downwards
+    }
+
+    @Test
+    fun asciiTechniques() {
+        val tab = """
+            PM|---------|
+            e|---5h7---9---|
+            B|-------------|
+            G|-------------|
+            D|-------------|
+            A|-------------|
+            E|-------------|
+
+            e|/7---5/9---5b7r---3~---x---<12>---|
+            B|-----------------------------------|
+            G|-----------------------------------|
+            D|-----------------------------------|
+            A|-----------------------------------|
+            E|-----------------------------------|
+        """.trimIndent()
+        val song = SongLoader.load("fx.txt", tab.toByteArray(Charsets.UTF_8))
+        val notes = song.tracks[0].notes.sortedBy { it.startTick }
+        assertEquals(10, notes.size)
+        fun at(tick: Long) = notes.first { it.startTick == tick }
+        // Block 1 (slot = 240 ticks): PM span covers cols 0..8
+        at(720).let {
+            assertEquals(5, it.fret)
+            assertTrue(it.effects.palmMute)
+            assertTrue(!it.effects.hammerPull)
+        }
+        at(1200).let {
+            assertEquals(7, it.fret)
+            assertTrue(it.effects.hammerPull)
+            assertTrue(it.effects.palmMute)
+        }
+        at(2160).let {
+            assertEquals(9, it.fret)
+            assertTrue(!it.effects.palmMute) // col 9 is past the PM span
+        }
+        // Block 2 starts at (14 + 2) * 240 = 3840
+        at(4080).let { assertEquals(-1, it.effects.slideType) } // /7 slide into from below
+        at(5040).let { assertEquals(1, it.effects.slideType) } // 5/9 slide out
+        at(6480).let { // 5b7r: bend up 2 semitones with release; target fret is not a note
+            assertEquals(2.0f, it.effects.bendSemitones, 0.01f)
+            assertEquals(2, it.effects.bendType)
+        }
+        at(8160).let { assertTrue(it.effects.vibrato) } // 3~
+        at(9360).let { assertEquals(-1, it.fret) } // x dead note
+        at(10320).let { // <12> natural harmonic
+            assertEquals(12, it.fret)
+            assertEquals(1, it.effects.harmonicType)
+        }
+    }
 }

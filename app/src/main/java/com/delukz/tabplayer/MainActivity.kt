@@ -79,9 +79,18 @@ private fun TabPlayerApp() {
     var variant by remember { mutableIntStateOf(0) }
     var bpm by remember { mutableIntStateOf(song.tempoBpm) }
     var loop by remember { mutableStateOf(false) }
+    // Practice loop + tempo trainer
+    var loopStartBar by remember { mutableIntStateOf(1) }
+    var loopEndBar by remember { mutableIntStateOf(song.measures.size) }
+    var trainerOn by remember { mutableStateOf(false) }
+    var startPct by remember { mutableIntStateOf(50) }
+    var stepPct by remember { mutableIntStateOf(5) }
+    var capPct by remember { mutableIntStateOf(100) }
 
     val currentTick by engine.positionTicks.collectAsState()
     val isPlaying by engine.isPlaying.collectAsState()
+    val speedPct by engine.speedPct.collectAsState()
+    val loopPass by engine.loopPass.collectAsState()
     val track = song.tracks.getOrNull(trackIndex) ?: song.tracks.first()
 
     DisposableEffect(Unit) { onDispose { engine.release() } }
@@ -91,6 +100,19 @@ private fun TabPlayerApp() {
     }
     LaunchedEffect(bpm) { engine.bpm = bpm }
     LaunchedEffect(loop) { engine.loop = loop }
+    LaunchedEffect(song, loopStartBar, loopEndBar) {
+        val s = song.measures.getOrNull(loopStartBar - 1)
+        val e = song.measures.getOrNull(loopEndBar - 1)
+        engine.loopStartTick = s?.startTick ?: 0L
+        engine.loopEndTick = e?.let { it.startTick + it.lengthTicks } ?: -1L
+    }
+    LaunchedEffect(trainerOn, startPct, stepPct, capPct) {
+        engine.trainerEnabled = trainerOn
+        engine.trainerStartPct = startPct
+        engine.trainerStepPct = stepPct
+        engine.trainerCapPct = capPct
+        engine.resetTrainer()
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -113,6 +135,8 @@ private fun TabPlayerApp() {
                 song = loaded
                 fileLabel = name
                 trackIndex = 0
+                loopStartBar = 1
+                loopEndBar = loaded.measures.size
                 family = defaultFamilyFor(loaded.tracks.first().kind)
                 variant = 0
                 bpm = loaded.tempoBpm
@@ -195,6 +219,7 @@ private fun TabPlayerApp() {
             currentTick = currentTick,
             onSeek = { engine.seekTo(it) },
             modifier = Modifier.weight(1f).fillMaxWidth().padding(top = 6.dp),
+            selectedBars = if (loop) loopStartBar..loopEndBar else null,
         )
 
         // Transport
@@ -237,6 +262,90 @@ private fun TabPlayerApp() {
                 modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
             )
             Text("$bpm BPM", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+        }
+        // Practice loop: bar range + tempo trainer
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            FilterChip(
+                selected = trainerOn,
+                onClick = { trainerOn = !trainerOn },
+                label = { Text("Tempo trainer") },
+            )
+            if (loop) {
+                Text(
+                    "Looping bars $loopStartBar–$loopEndBar" +
+                        if (trainerOn) " • Speed $speedPct% • Pass ${loopPass + 1}" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else if (trainerOn) {
+                Text("Trainer works with loop on", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (loop && song.measures.size > 1) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("From", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = loopStartBar.toFloat(),
+                    onValueChange = { v ->
+                        loopStartBar = v.toInt().coerceIn(1, loopEndBar)
+                    },
+                    valueRange = 1f..song.measures.size.toFloat(),
+                    steps = (song.measures.size - 2).coerceAtLeast(0),
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                )
+                Text("Bar $loopStartBar", style = MaterialTheme.typography.bodySmall)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("To", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = loopEndBar.toFloat(),
+                    onValueChange = { v ->
+                        loopEndBar = v.toInt().coerceIn(loopStartBar, song.measures.size)
+                    },
+                    valueRange = 1f..song.measures.size.toFloat(),
+                    steps = (song.measures.size - 2).coerceAtLeast(0),
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                )
+                Text("Bar $loopEndBar", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (trainerOn) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Start", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = startPct.toFloat(),
+                    onValueChange = { startPct = it.toInt() },
+                    valueRange = 30f..100f,
+                    steps = 13,
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                )
+                Text("$startPct%", style = MaterialTheme.typography.bodySmall)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Step", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = stepPct.toFloat(),
+                    onValueChange = { stepPct = it.toInt() },
+                    valueRange = 1f..20f,
+                    steps = 18,
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                )
+                Text("+$stepPct% / pass", style = MaterialTheme.typography.bodySmall)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Cap", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = capPct.toFloat(),
+                    onValueChange = { capPct = it.toInt() },
+                    valueRange = 50f..150f,
+                    steps = 19,
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                )
+                Text("$capPct%", style = MaterialTheme.typography.bodySmall)
+            }
         }
         Text(
             "Song tempo: ${song.tempoBpm} BPM • Tap the score to jump • One track plays at a time",

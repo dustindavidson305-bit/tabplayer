@@ -5,6 +5,40 @@ const val PPQ = 480L
 
 enum class TrackKind { GUITAR, BASS, DRUMS, KEYS, OTHER }
 
+/**
+ * Guitar techniques attached to a note, as carried by GP note/beat effects
+ * or ASCII tab conventions. All defaults = plain note.
+ *
+ * Slide types use the PyGuitarPro SlideType encoding: -2 = slide into
+ * from above, -1 = slide into from below, 1 = shift slide (to next note),
+ * 2 = legato slide (to next note), 3 = slide out downwards, 4 = slide out
+ * upwards. (On disk, GP5 stores slides as a bitmask and GP3/GP4 as this
+ * signed type number; the parsers normalize both to these values.)
+ * Harmonic types use the GP encoding: 1 natural, 2 artificial, 3 tapped,
+ * 4 pinch, 5 semi.
+ */
+data class NoteEffects(
+    val bendSemitones: Float = 0f,   // peak bend amount (max bend point), semitones
+    val bendType: Int = 0,           // GP bend type: 1 bend, 2 bend+release, 4 prebend, 5 prebend+release, ...
+    val slideType: Int = 0,
+    val hammerPull: Boolean = false, // hammer-on / pull-off from previous note on the same string
+    val palmMute: Boolean = false,
+    val letRing: Boolean = false,
+    val staccato: Boolean = false,
+    val vibrato: Boolean = false,
+    val harmonicType: Int = 0,
+) {
+    val hasBend: Boolean get() = bendSemitones > 0.01f
+    val isHarmonic: Boolean get() = harmonicType != 0
+    val slideOut: Boolean get() = slideType in 1..4
+    val slideIn: Boolean get() = slideType < 0
+    val isPlain: Boolean
+        get() = !hasBend && slideType == 0 && !hammerPull && !palmMute && !letRing &&
+            !staccato && !vibrato && harmonicType == 0
+}
+
+val NO_EFFECTS = NoteEffects()
+
 data class NoteEvent(
     val startTick: Long,
     val durationTicks: Long,
@@ -14,6 +48,7 @@ data class NoteEvent(
     val velocity: Int = 100,
     val dead: Boolean = false,
     val tie: Boolean = false,
+    val effects: NoteEffects = NO_EFFECTS,
 )
 
 data class MeasureInfo(

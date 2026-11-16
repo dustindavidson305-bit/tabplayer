@@ -194,14 +194,39 @@ object GpxParser {
         var stringNum = 0
         var fret = -1
         var midi: Int? = null
+        // Best-effort technique detection (GPIF stores these as note
+        // properties or dedicated child elements; shapes vary by exporter).
+        var palmMute = false
+        var bendSemitones = 0f
+        var slideType = 0
+        var harmonicType = 0
         val props = noteEl.getElementsByTagName("Property")
         for (pi in 0 until props.length) {
             val p = props.item(pi) as Element
+            if (p.getAttribute("name") == "PalmMute") {
+                palmMute = p.getElementsByTagName("Enable").length > 0 ||
+                    p.textContent.trim().lowercase() in listOf("1", "true")
+                continue
+            }
             val value = p.textContent.trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull() ?: continue
             when (p.getAttribute("name")) {
                 "String" -> stringNum = value
                 "Fret" -> fret = value
                 "Midi" -> midi = value
+                "HarmonicType" -> harmonicType = value
+                "Slide" -> slideType = 1
+                "Bend" -> if (bendSemitones == 0f) bendSemitones = 2f
+            }
+        }
+        val descendants = noteEl.getElementsByTagName("*")
+        for (di in 0 until descendants.length) {
+            val el = descendants.item(di) as Element
+            when {
+                el.tagName.equals("Bend", ignoreCase = true) ->
+                    if (bendSemitones == 0f) bendSemitones = bendFromElement(el)
+                el.tagName.equals("Slide", ignoreCase = true) -> slideType = 1
+                el.tagName.equals("Harmonic", ignoreCase = true) ->
+                    if (harmonicType == 0) harmonicType = 1
             }
         }
         val tie = noteEl.getElementsByTagName("Tie").length > 0
@@ -217,7 +242,26 @@ object GpxParser {
             string = stringNum,
             fret = fret,
             tie = tie,
+            effects = NoteEffects(
+                bendSemitones = bendSemitones,
+                bendType = if (bendSemitones > 0f) 1 else 0,
+                slideType = slideType,
+                palmMute = palmMute,
+                harmonicType = harmonicType,
+            ),
         )
+    }
+
+    /** Peak bend (semitones) from a GPIF Bend element's point values, if readable. */
+    private fun bendFromElement(bendEl: Element): Float {
+        val values = bendEl.getElementsByTagName("Value")
+        var maxV = -1
+        for (i in 0 until values.length) {
+            val v = values.item(i).textContent.trim().toIntOrNull() ?: continue
+            if (v > maxV) maxV = v
+        }
+        // GPIF bend values use the same 1/100-of-a-tone scale as the binary formats.
+        return if (maxV in 20..800) (maxV / 50f).coerceIn(0.25f, 4f) else 2f
     }
 
     private fun extractScoreXml(data: ByteArray): ByteArray? {

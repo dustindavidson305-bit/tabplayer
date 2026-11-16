@@ -29,6 +29,12 @@ object DemoSong {
             }
             start += 4 * PPQ
         }
+        // Sprinkle a few techniques so the demo shows the notation + playback:
+        // a hammer-on (bar 3, C -> D on the B string), vibrato on the held D
+        // in bar 4, and a half-step bend on the final held C.
+        guitarNotes[10] = guitarNotes[10].copy(effects = NoteEffects(hammerPull = true))
+        guitarNotes[14] = guitarNotes[14].copy(effects = NoteEffects(vibrato = true))
+        guitarNotes[29] = guitarNotes[29].copy(effects = NoteEffects(bendSemitones = 1f, bendType = 1))
         // Simple drum groove: kick on beats, snare on 2 & 4, hats on eighths.
         val drumNotes = mutableListOf<NoteEvent>()
         for (m in 0 until 8) {

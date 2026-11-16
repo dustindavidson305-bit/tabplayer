@@ -426,7 +426,8 @@ object GpParser {
             if (flags and 0x01 != 0) r.f64() // duration percent
             r.u8() // flags2
         }
-        if (flags and 0x08 != 0) readNoteEffects(r, major)
+        var effects = NO_EFFECTS
+        if (flags and 0x08 != 0) effects = readNoteEffects(r, major)
         if (discard || !hasFret) return
         if (type == 2) { // tie: reuse fret of previous note on same string (keep stored fret if none)
             val prev = ctx.out.lastOrNull { it.string == stringNumber && !it.tie }
@@ -449,44 +450,108 @@ object GpParser {
                 velocity = velocity,
                 dead = type == 3,
                 tie = type == 2,
+                effects = effects,
             )
         )
     }
 
-    private fun readNoteEffects(r: GpReader, major: Int) {
+    /**
+     * Reads note effects and returns them as a [NoteEffects]. The byte
+     * consumption order is unchanged from the plain-skip version: flag-only
+     * bits (hammer, let-ring, palm mute, staccato, vibrato) carry no payload.
+     */
+    private fun readNoteEffects(r: GpReader, major: Int): NoteEffects {
         if (major == 3) {
             val flags = r.u8()
-            if (flags and 0x01 != 0) readBend(r)
-            if (flags and 0x10 != 0) readGrace(r, major)
-            // 0x04 slide: no payload in GP3
-        } else {
-            val flags1 = r.i8()
-            val flags2 = r.i8()
-            if (flags1 and 0x01 != 0) readBend(r)
-            if (flags1 and 0x10 != 0) readGrace(r, major)
-            if (flags2 and 0x04 != 0) r.i8() // tremolo picking
-            if (flags2 and 0x08 != 0) r.i8() // slide type
-            if (flags2 and 0x10 != 0) { // harmonic
-                if (major == 5) {
-                    when (r.i8()) {
-                        2 -> { r.u8(); r.i8(); r.u8() } // artificial: note, accidental, octave
-                        3 -> r.u8() // tapped: fret
-                    }
-                } else {
-                    r.i8() // harmonic type (GP4)
-                }
+            var bendSemitones = 0f
+            var bendType = 0
+            if (flags and 0x01 != 0) {
+                val (st, type) = readBend(r)
+                bendSemitones = st; bendType = type
             }
-            if (flags2 and 0x20 != 0) { r.i8(); r.i8() } // trill
+            if (flags and 0x10 != 0) readGrace(r, major)
+            return NoteEffects(
+                bendSemitones = bendSemitones,
+                bendType = bendType,
+                slideType = if (flags and 0x04 != 0) 1 else 0, // shift slide, no payload in GP3
+                hammerPull = flags and 0x02 != 0,
+                letRing = flags and 0x08 != 0,
+            )
+        }
+        val flags1 = r.i8()
+        val flags2 = r.i8()
+        var bendSemitones = 0f
+        var bendType = 0
+        if (flags1 and 0x01 != 0) {
+            val (st, type) = readBend(r)
+            bendSemitones = st; bendType = type
+        }
+        if (flags1 and 0x10 != 0) readGrace(r, major)
+        if (flags2 and 0x04 != 0) r.i8() // tremolo picking (display/playback not modelled)
+        var slideType = 0
+        if (flags2 and 0x08 != 0) {
+            val raw = r.i8()
+            // GP5 stores slides as a bitmask; GP4 stores the signed type number.
+            slideType = if (major == 5) decodeGp5SlideMask(raw) else raw
+        }
+        var harmonicType = 0
+        if (flags2 and 0x10 != 0) { // harmonic
+            if (major == 5) {
+                val type = r.i8()
+                harmonicType = type
+                when (type) {
+                    2 -> { r.u8(); r.i8(); r.u8() } // artificial: note, accidental, octave
+                    3 -> r.u8() // tapped: fret
+                }
+            } else {
+                harmonicType = r.i8() // harmonic type (GP4)
+            }
+        }
+        if (flags2 and 0x20 != 0) { r.i8(); r.i8() } // trill (not modelled)
+        return NoteEffects(
+            bendSemitones = bendSemitones,
+            bendType = bendType,
+            slideType = slideType,
+            hammerPull = flags1 and 0x02 != 0,
+            palmMute = flags2 and 0x02 != 0,
+            letRing = flags1 and 0x04 != 0,
+            staccato = flags2 and 0x01 != 0,
+            vibrato = flags2 and 0x40 != 0,
+            harmonicType = harmonicType,
+        )
+    }
+
+    /**
+     * GP5 slide bitmask -> SlideType value. Bits: 0x01 shift, 0x02 legato,
+     * 0x04 out downwards, 0x08 out upwards, 0x10 into from below, 0x20 into
+     * from above. A note can carry several; prefer the "to next note" kinds.
+     */
+    private fun decodeGp5SlideMask(raw: Int): Int {
+        val b = raw and 0xFF
+        return when {
+            b and 0x02 != 0 -> 2
+            b and 0x01 != 0 -> 1
+            b and 0x04 != 0 -> 3
+            b and 0x08 != 0 -> 4
+            b and 0x10 != 0 -> -1
+            b and 0x20 != 0 -> -2
+            else -> 0
         }
     }
 
-    private fun readBend(r: GpReader) {
-        r.i8() // type
-        r.i32() // value
+    /** Returns (peak bend in semitones, bend type). GP bend values are in 1/100 of a tone. */
+    private fun readBend(r: GpReader): Pair<Float, Int> {
+        val type = r.i8()
+        var maxValue = r.i32() // total value
         val count = r.i32()
         repeat(count.coerceIn(0, 1000)) {
-            r.i32(); r.i32(); r.bool()
+            r.i32() // position
+            val v = r.i32() // point value
+            if (v > maxValue) maxValue = v
+            r.bool() // vibrato
         }
+        // 100 units = 1 tone = 2 semitones.
+        return (maxValue / 50f) to type
     }
 
     private fun readGrace(r: GpReader, major: Int) {
