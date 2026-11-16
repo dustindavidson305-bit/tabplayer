@@ -346,7 +346,7 @@ private fun SystemCanvas(
                     }
                     // Staccato dot above the staff note head.
                     if (fx.staccato) {
-                        drawCircle(color, Offset(x, y - 13.dp.toPx()), radius = 1.8.dp.toPx())
+                        drawCircle(color = color, center = Offset(x, y - 13.dp.toPx()), radius = 1.8.dp.toPx())
                     }
                     // Bend: curved arrow above the tab, labelled with the amount.
                     if (fx.hasBend) {
