@@ -4,9 +4,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlin.math.abs
-import kotlin.math.sign
-import kotlin.math.tanh
 
 /**
  * Streaming playback engine: schedules the selected track's notes through
@@ -16,9 +13,13 @@ import kotlin.math.tanh
  * v1.1: per-note technique shaping (bends, slides, palm mutes, harmonics,
  * vibrato, hammer-ons), a practice loop over a selected bar range, and a
  * tempo trainer that raises the speed by a set % after each loop pass.
- * The mixer uses a soft-knee limiter that is linear below 0.75 instead of
- * v1.0's always-on tanh squash (a major cause of the "everything sounds
- * distorted" complaint, together with the old synth).
+ *
+ * v1.2: the synth is now a port of Fruity McLoops' Web Audio recipes, and
+ * the mixer runs Fruity's master chain — a 0.92 bus gain into a
+ * DynamicsCompressor with Fruity's settings (threshold -14 dB, knee 22,
+ * ratio 5, attack 0.004, release 0.18) — instead of v1.1's soft-knee tanh,
+ * so chords and overlapping notes are glued together the way Fruity does
+ * it rather than squashed or clipped.
  */
 class PlayerEngine {
 
@@ -193,6 +194,7 @@ class PlayerEngine {
 
     private fun renderLoop(at: AudioTrack) {
         val sr = Synth.SAMPLE_RATE
+        val compressor = MasterCompressor(sr = sr)
         val blockFrames = 1024
         val out = ShortArray(blockFrames)
         val voices = mutableListOf<Voice>()
@@ -237,7 +239,10 @@ class PlayerEngine {
                 eventIndex++
             }
 
-            // Mix with a soft-knee limiter (linear below 0.75, gentle above).
+            // Mix through Fruity's master chain: 0.92 bus gain into the
+            // DynamicsCompressor (Fruity settings), plus a soft ceiling
+            // that only touches the first milliseconds of extreme onsets
+            // the compressor's 4 ms attack can't fully catch.
             for (f in 0 until blockFrames) {
                 var sum = 0f
                 for (vi in voices.indices) {
@@ -247,11 +252,8 @@ class PlayerEngine {
                         v.cursor++
                     }
                 }
-                val x = sum * 0.9f
-                val ax = abs(x)
-                val y = if (ax <= 0.75f) x
-                    else sign(x) * (0.75f + 0.25f * tanh(((ax - 0.75f) / 0.25f).toDouble()).toFloat())
-                out[f] = (y * 32767).toInt().toShort()
+                val y = softCeiling(compressor.process(sum * 0.92f))
+                out[f] = (y.coerceIn(-1f, 1f) * 32767).toInt().toShort()
             }
             voices.removeAll { v -> v.cursor >= v.samples.size }
 

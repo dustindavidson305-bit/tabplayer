@@ -2,11 +2,8 @@ package com.delukz.tabplayer
 
 import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.sin
-import kotlin.math.tanh
-import kotlin.random.Random
 
 enum class SoundFamily { GUITAR, BASS, DRUMS, KEYS }
 
@@ -38,14 +35,40 @@ fun midiToFreq(midi: Int): Double = 440.0 * 2.0.pow((midi - 69) / 12.0)
  * Pure synthesis: renders one note (or one drum hit) to a mono FloatArray.
  * No Android dependencies, so it is unit-testable.
  *
- * v1.1 audio rework: the v1.0 guitar sound was harsh because (a) raw white
- * noise KS excitation put a burst of high-frequency fizz on every note,
- * (b) loop brightness ~0.999 made high partials ring almost undamped,
- * (c) no note was ever peak-normalized, so overlapping ringing voices drove
- * the mixer's tanh into constant saturation. Now the excitation is
- * lowpassed per variant, the KS loop gain is derived from a target decay
- * time, and every rendered note is peak-normalized to a known level so the
- * mixer stays in its linear range.
+ * v1.2 audio rework — "use the same sound engine as Fruity McLoops".
+ * Fruity is a Web Audio app: every sound is a recipe of oscillators,
+ * biquad filters and gain envelopes summed into a master
+ * DynamicsCompressor. v1.0/v1.1 used a hand-rolled Karplus-Strong synth
+ * that Delukz still heard as harsh and distorted, so v1.2 replaces the
+ * synth outright with ports of Fruity's actual recipes running on the
+ * offline Web Audio primitives in Engine.kt:
+ *
+ *   Guitar  Acoustic Steel  <- Fruity "guitarpluck" (Keys)
+ *           Nylon Classic   <- guitarpluck, darker/quieter layers (documented tweak)
+ *           Clean Electric  <- Fruity "pluck" (Lead Pluck)
+ *           Distorted       <- Fruity "superpluck" stack through Fruity's distortion curve
+ *           Muted Pluck     <- guitarpluck with decays x0.16 and filters x0.55 (documented tweak)
+ *   Bass    Fingered        <- Fruity "pluckbass"
+ *           Picked          <- pluckbass with a brighter sweep + pick noise (documented tweak)
+ *           Slap            <- pluckbass (hotter sweep) + a sine pitch-drop thump
+ *           Fretless        <- Fruity "vintagebass" + a short pitch glide-in (documented tweak)
+ *           Synth Bass      <- Fruity "acidbass" (Acid Bass 303)
+ *   Keys    Grand Piano     <- Fruity "epiano" FM pair, index lowered, longer decay (documented tweak)
+ *           Electric Piano  <- Fruity "epiano"
+ *           Organ           <- Fruity "organ" (Drawbar Organ)
+ *           Music Box       <- Fruity "musicbox"
+ *           Synth Lead      <- Fruity "squarelead"
+ *   Drums   kits assembled from Fruity's kick / snare / clap / hat /
+ *           openhat / tom / crash and the v2-expansion deepkick / kick2 /
+ *           lofikick / snare2 / noisesnare / brushsnare / clapstack /
+ *           electrotom / cowbell / stick / shaker / pedalhat recipes.
+ *
+ * Fruity is a step sequencer whose pluck recipes have fixed decays, so
+ * where a recipe's decay is fixed the port scales it toward the note's
+ * written duration (long notes ring longer); peaks, filter frequencies,
+ * Q values, envelope shapes and the distortion curve are Fruity's own.
+ * Per-note peak normalization (target per family) is kept as a backstop,
+ * and the player mixer now runs Fruity's master compressor settings.
  */
 object Synth {
     const val SAMPLE_RATE = 44100
@@ -64,6 +87,14 @@ object Synth {
         val softAttack: Boolean = false,   // hammer-on / legato target: gentler attack
     )
 
+    /** Recipe-level shaping derived from FxSpec / dead-note state. */
+    private data class Shape(
+        val decayScale: Double = 1.0,  // <1 shortens all decays (palm mute, dead note)
+        val filterScale: Double = 1.0, // <1 darkens filters (palm mute, dead note)
+        val noiseScale: Double = 1.0,  // <1 quiets pick/attack noise (legato targets)
+        val attackSec: Double = 0.0,   // extra fade-in (legato targets)
+    )
+
     fun renderNote(family: SoundFamily, variant: Int, pitch: Int, velocity: Int,
                    durationSec: Double, dead: Boolean = false, fx: FxSpec = FxSpec()): FloatArray {
         val vel = velocity.coerceIn(1, 127) / 127f
@@ -72,265 +103,297 @@ object Synth {
         var dur = durationSec
         if (fx.staccato) dur = minOf(dur, maxOf(0.09, durationSec * 0.45))
         if (fx.palmMute && family == SoundFamily.KEYS) dur = minOf(dur, 0.35)
+        val shape = Shape(
+            decayScale = when {
+                dead -> 0.12
+                fx.palmMute -> 0.30
+                else -> 1.0
+            },
+            filterScale = if (fx.palmMute || dead) 0.55 else 1.0,
+            noiseScale = if (fx.softAttack) 0.3 else 1.0,
+            attackSec = if (fx.softAttack) 0.02 else 0.0,
+        )
         val needsGlide = fx.bendSemitones > 0.01f || fx.prebend ||
             abs(fx.slideFromSemitones) > 0.01f || abs(fx.slideToSemitones) > 0.01f || fx.vibrato
         // Render a little extra material when a pitch contour will consume it faster.
         val renderDur = if (needsGlide) dur * 1.3 + 0.05 else dur
-        var buf = when (family) {
-            SoundFamily.GUITAR -> renderPluck(effPitch, vel, renderDur, guitarParams(variant), dead, fx)
-            SoundFamily.BASS -> renderBass(variant, effPitch, vel, renderDur, dead, fx)
-            SoundFamily.KEYS -> renderKeys(variant, effPitch, vel, renderDur)
+        val f = midiToFreq(effPitch)
+        val voice = when (family) {
+            SoundFamily.GUITAR -> guitarVoice(variant, f, renderDur, shape)
+            SoundFamily.BASS -> bassVoice(variant, f, renderDur, shape)
+            SoundFamily.KEYS -> keysVoice(variant, f, renderDur, shape)
             SoundFamily.DRUMS -> error("handled above")
         }
+        val n = (voice.seconds * SAMPLE_RATE).toInt().coerceIn(256, SAMPLE_RATE * 8)
+        var buf = voice.node.render(n, SAMPLE_RATE)
         if (fx.harmonic) buf = scale(buf, 0.6f)
         if (needsGlide) buf = applyPitchContour(buf, fx, dur)
-        return buf
+        microFades(buf, shape.attackSec)
+        val target = when (family) {
+            SoundFamily.GUITAR -> 0.80f
+            SoundFamily.BASS -> 0.85f
+            else -> 0.78f
+        } * (0.30f + 0.70f * vel)
+        return normalize(buf, target)
     }
 
-    // ---------- Plucked strings (Karplus-Strong) ----------
+    // ---------- Voice assembly ----------
 
-    private data class PluckParams(
-        val decayTime: Double,       // seconds for the fundamental to fall ~ -60 dB
-        // Length of the circular moving-average applied to the noise burst
-        // excitation: 1 = raw noise (harsh), larger = darker/softer attack.
-        val excitationBox: Int,
-        val distortion: Double,      // drive amount; 0 = clean (only the Distorted variant uses it)
-        val targetPeak: Float,       // peak after normalization at velocity 127
-    )
-
-    private fun guitarParams(variant: Int): PluckParams = when (variant) {
-        0 -> PluckParams(2.4, 3, 0.0, 0.80f)  // Acoustic Steel: bright pluck, moderate decay
-        1 -> PluckParams(1.7, 14, 0.0, 0.78f) // Nylon Classic: soft, warm, highs die fast
-        2 -> PluckParams(3.2, 6, 0.0, 0.80f)  // Clean Electric: smooth, long sustain, no grit
-        3 -> PluckParams(3.4, 5, 0.85, 0.85f) // Distorted: the only gritty one
-        else -> PluckParams(0.22, 18, 0.0, 0.75f) // Muted Pluck: very short, dark, percussive
+    private class Voice(val node: AudioNode, val seconds: Double, val offset: Double = 0.0) {
+        fun delayed(at: Double): Voice = Voice(node, seconds, at)
     }
 
-    private fun renderPluck(pitch: Int, vel: Float, durationSec: Double, p: PluckParams,
-                            dead: Boolean, fx: FxSpec): FloatArray {
-        val sr = SAMPLE_RATE
-        val freq = midiToFreq(pitch)
-        var decay = p.decayTime
-        var excBox = p.excitationBox
-        if (dead) decay = minOf(decay, 0.10)
-        if (fx.palmMute) {
-            decay = minOf(decay, 0.30)
-            excBox = maxOf(excBox, 16) // darker
-        }
-        if (fx.softAttack) excBox = maxOf(excBox, 10)
-        // Total length: at least the written duration, plus some ring-out, capped.
-        val totalSec = minOf(maxOf(durationSec, minOf(decay, durationSec + decay * 0.5)), decay + 0.4)
-            .coerceIn(0.05, 6.0)
-        val n = (totalSec * sr).toInt().coerceAtLeast(256)
-        val out = FloatArray(n)
-
-        // Fractional-delay KS: ring length P plus blend S tunes the string exactly.
-        val desiredPeriod = sr / freq
-        var period = desiredPeriod.toInt().coerceAtLeast(2)
-        var blend = (desiredPeriod - period).coerceIn(0.05, 0.95)
-        if (period < 3) { period = 2; blend = 0.5 }
-        val ring = FloatArray(period)
-        val rnd = Random(pitch * 7919 + (p.decayTime * 1000).toInt() + excBox * 131)
-        for (i in 0 until period) ring[i] = rnd.nextFloat() * 2f - 1f
-        // Band-limit the excitation burst with a circular moving average so
-        // the attack isn't raw full-band digital fizz (and there's no wrap
-        // discontinuity where the ring loops).
-        if (excBox > 1) {
-            val src = ring.copyOf()
-            val half = excBox / 2
-            for (i in 0 until period) {
-                var acc = 0f
-                for (k in -half..half) acc += src[(i + k).mod(period)]
-                ring[i] = acc / (2 * half + 1)
-            }
-        }
-        // Loop gain for ~ -60 dB after decayTime seconds at the fundamental.
-        val periodsPerDecay = maxOf(1.0, freq * decay)
-        val loopGain = minOf(0.9995, 0.001.pow(1.0 / periodsPerDecay))
-
-        var idx = 0
-        val fadeIn = minOf(64, n / 4)
-        val fadeOut = minOf((0.02 * sr).toInt(), n / 4)
-        for (i in 0 until n) {
-            val cur = ring[idx]
-            val next = ring[(idx + 1) % period]
-            ring[idx] = (loopGain * ((1.0 - blend) * cur + blend * next)).toFloat()
-            var env = 1f
-            if (i < fadeIn) env = i.toFloat() / fadeIn
-            if (i >= n - fadeOut) env *= (n - i).toFloat() / fadeOut
-            out[i] = cur * env
-            idx = (idx + 1) % period
-        }
-        if (p.distortion > 0.0) {
-            // Amp-style waveshaping over the whole note (attack gritty, tail
-            // cleaner), then a one-pole pass to tame fizz. Only the Distorted
-            // variant ever takes this branch.
-            val drive = 1.0 + p.distortion * 7.0
-            val norm = tanh(drive * 0.55)
-            var lp = 0f
-            for (i in 0 until n) {
-                val shaped = (tanh(out[i] * drive) / norm).toFloat()
-                lp += 0.5f * (shaped - lp)
-                out[i] = lp
-            }
-        }
-        val target = p.targetPeak * (0.30f + 0.70f * vel) * (if (fx.softAttack) 0.9f else 1f)
-        return normalize(out, target)
-    }
-
-    // ---------- Bass ----------
-
-    private fun renderBass(variant: Int, pitch: Int, vel: Float, durationSec: Double,
-                           dead: Boolean, fx: FxSpec): FloatArray {
-        return when (variant) {
-            0 -> renderPluck(pitch, vel, durationSec, PluckParams(2.0, 9, 0.0, 0.85f), dead, fx) // Fingered
-            1 -> renderPluck(pitch, vel, durationSec, PluckParams(2.4, 3, 0.0, 0.85f), dead, fx) // Picked
-            2 -> { // Slap: bright clean pluck + pitch-drop thump, normalized as one
-                val pluck = renderPluck(pitch, vel, durationSec, PluckParams(1.4, 2, 0.0, 0.9f), dead, fx)
-                val thump = renderToneBurst(midiToFreq(pitch) * 0.5, 0.09, 0.8f, sweepTo = midiToFreq(pitch) * 0.25)
-                mixInto(pluck, thump)
-                normalize(pluck, 0.85f * (0.30f + 0.70f * vel))
-            }
-            3 -> renderFretless(pitch, vel, durationSec) // Fretless
-            else -> renderSynthBass(pitch, vel, durationSec) // Synth Bass
-        }
-    }
-
-    private fun renderFretless(pitch: Int, vel: Float, durationSec: Double): FloatArray {
-        val sr = SAMPLE_RATE
-        val total = minOf(maxOf(durationSec, 0.4), 4.0)
-        val n = (total * sr).toInt()
-        val out = FloatArray(n)
-        val f0 = midiToFreq(pitch)
-        var phase = 0.0
-        for (i in 0 until n) {
-            val t = i.toDouble() / sr
-            // Slight upward glide at attack, gentle vibrato after.
-            val glide = 1.0 - 0.06 * exp(-t * 18.0)
-            val vib = 1.0 + 0.004 * sin(2 * PI * 5.0 * t) * minOf(1.0, t * 2)
-            val f = f0 * glide * vib
-            phase += 2 * PI * f / sr
-            val attack = minOf(1.0, t * 30)
-            val release = if (t > total - 0.08) maxOf(0.0, (total - t) / 0.08) else 1.0
-            val s = sin(phase) * 0.8 + sin(phase * 2) * 0.25 + sin(phase * 3) * 0.08
-            out[i] = (s * attack * release).toFloat()
-        }
-        return normalize(out, 0.80f * (0.30f + 0.70f * vel))
-    }
-
-    private fun renderSynthBass(pitch: Int, vel: Float, durationSec: Double): FloatArray {
-        val sr = SAMPLE_RATE
-        val total = minOf(maxOf(durationSec, 0.25), 4.0)
-        val n = (total * sr).toInt()
-        val out = FloatArray(n)
-        val f0 = midiToFreq(pitch)
-        var phase = 0.0
-        var lp = 0.0
-        for (i in 0 until n) {
-            val t = i.toDouble() / sr
-            phase += 2 * PI * f0 / sr
-            // Sawtooth via phase wrap.
-            val saw = (phase / PI) % 2.0 - 1.0
-            val cutoff = 0.05 + 0.5 * exp(-t * 6.0)
-            lp += cutoff * (saw - lp)
-            val release = if (t > total - 0.05) maxOf(0.0, (total - t) / 0.05) else 1.0
-            out[i] = (lp * release).toFloat()
-        }
-        return normalize(out, 0.85f * (0.30f + 0.70f * vel))
-    }
-
-    // ---------- Keyboard ----------
-
-    private fun renderKeys(variant: Int, pitch: Int, vel: Float, durationSec: Double): FloatArray {
-        val sr = SAMPLE_RATE
-        val f0 = midiToFreq(pitch)
-        val target = 0.78f * (0.30f + 0.70f * vel)
-        return when (variant) {
-            0 -> { // Grand Piano: additive harmonics, exponential decay
-                val total = minOf(maxOf(durationSec * 1.5, 0.8), 5.0)
-                val n = (total * sr).toInt()
+    private fun sumVoices(vararg voices: Voice): Voice {
+        val total = voices.maxOf { it.offset + it.seconds }
+        val comp = object : AudioNode() {
+            override fun compute(n: Int, sr: Int): FloatArray {
                 val out = FloatArray(n)
-                val amps = doubleArrayOf(1.0, 0.55, 0.32, 0.18, 0.10, 0.05)
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    var s = 0.0
-                    for (h in amps.indices) {
-                        val decay = exp(-t * (1.6 + h * 0.9))
-                        s += amps[h] * sin(2 * PI * f0 * (h + 1) * t) * decay
+                for (v in voices) {
+                    val len = (v.seconds * sr).toInt()
+                    val b = v.node.render(len, sr)
+                    val off = (v.offset * sr).toInt()
+                    for (i in b.indices) {
+                        val j = off + i
+                        if (j in 0 until n) out[j] += b[i]
                     }
-                    out[i] = s.toFloat()
                 }
-                normalize(out, target)
-            }
-            1 -> { // Electric Piano: FM bell-ish tine
-                val total = minOf(maxOf(durationSec * 1.3, 0.7), 4.0)
-                val n = (total * sr).toInt()
-                val out = FloatArray(n)
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    val modIndex = 3.0 * exp(-t * 5.0) + 0.4
-                    val s = sin(2 * PI * f0 * t + modIndex * sin(2 * PI * f0 * 3.01 * t)) * exp(-t * 1.8)
-                    out[i] = s.toFloat()
-                }
-                normalize(out, target)
-            }
-            2 -> { // Organ: sustained additive drawbars
-                val total = minOf(maxOf(durationSec, 0.3), 6.0)
-                val n = (total * sr).toInt()
-                val out = FloatArray(n)
-                val amps = doubleArrayOf(1.0, 0.6, 0.8, 0.3, 0.45, 0.2, 0.15, 0.1)
-                val mult = doubleArrayOf(0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0)
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    var s = 0.0
-                    for (h in amps.indices) s += amps[h] * sin(2 * PI * f0 * mult[h] * t)
-                    val attack = minOf(1.0, t * 60)
-                    val release = if (t > total - 0.06) maxOf(0.0, (total - t) / 0.06) else 1.0
-                    out[i] = (s * attack * release).toFloat()
-                }
-                normalize(out, target)
-            }
-            3 -> { // Music Box: pure sine + octave partial, fast decay
-                val total = minOf(maxOf(durationSec, 0.9), 3.0)
-                val n = (total * sr).toInt()
-                val out = FloatArray(n)
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    val s = sin(2 * PI * f0 * t) * exp(-t * 3.5) +
-                        0.35 * sin(2 * PI * f0 * 4 * t) * exp(-t * 9.0) +
-                        0.12 * sin(2 * PI * f0 * 9.2 * t) * exp(-t * 16.0)
-                    out[i] = s.toFloat()
-                }
-                normalize(out, target)
-            }
-            else -> { // Synth Lead: detuned saws through sweeping lowpass
-                val total = minOf(maxOf(durationSec, 0.3), 5.0)
-                val n = (total * sr).toInt()
-                val out = FloatArray(n)
-                var ph1 = 0.0; var ph2 = 0.0; var lp = 0.0
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    ph1 += 2 * PI * f0 / sr
-                    ph2 += 2 * PI * f0 * 1.005 / sr
-                    val saw = ((ph1 / PI) % 2.0 - 1.0) + ((ph2 / PI) % 2.0 - 1.0)
-                    val cutoff = 0.08 + 0.45 * exp(-t * 2.5)
-                    lp += cutoff * (saw * 0.5 - lp)
-                    val attack = minOf(1.0, t * 80)
-                    val release = if (t > total - 0.07) maxOf(0.0, (total - t) / 0.07) else 1.0
-                    out[i] = (lp * attack * release).toFloat()
-                }
-                normalize(out, target)
+                return out
             }
         }
+        return Voice(comp, total)
     }
 
-    // ---------- Drums ----------
+    /** Fruity's envGain(): gain starts at peak and exponential-ramps to 0.001 over decay. */
+    private fun envGainVoice(input: AudioNode, peak: Double, decay: Double): Voice {
+        val g = Param(1.0)
+        g.setValueAtTime(peak, 0.0)
+        g.exponentialRampToValueAtTime(0.001, decay)
+        return Voice(GainNode(input, g), decay + 0.1)
+    }
 
-    private enum class DrumPiece { KICK, SNARE, CLAP, HAT_CLOSED, HAT_OPEN, TOM, CRASH, RIDE, COWBELL, SHAKER, UNKNOWN }
+    /** Gain envelope shared by the _tone/_noise ports (attack ramp) and envGain-style hits (instant). */
+    private fun gainEnv(peak: Double, dur: Double, attack: Double, instant: Boolean): Param {
+        val g = Param(1.0)
+        if (instant) {
+            g.setValueAtTime(peak, 0.0)
+            g.exponentialRampToValueAtTime(0.001, dur)
+        } else {
+            g.setValueAtTime(0.0001, 0.0)
+            g.linearRampToValueAtTime(peak, attack)
+            g.exponentialRampToValueAtTime(0.001, dur)
+        }
+        return g
+    }
+
+    /** Port of Fruity's _tone() helper. */
+    private fun tone(
+        type: Wave, f0: Double, f1: Double? = null, ft: Double? = null,
+        dur: Double, peak: Double, a: Double = 0.005,
+        lp: Double? = null, q: Double? = null,
+        instant: Boolean = false, glideFrom: Double? = null,
+    ): Voice {
+        val freq = Param(f0 * (glideFrom ?: 1.0))
+        if (glideFrom != null && glideFrom != 1.0) freq.exponentialRampToValueAtTime(f0, 0.07)
+        if (f1 != null) freq.exponentialRampToValueAtTime(f1, ft ?: dur)
+        var node: AudioNode = OscNode(type, freq)
+        if (lp != null) node = BiquadNode(node, BiquadType.LOWPASS, Param(lp), Param(q ?: 1.0))
+        return Voice(GainNode(node, gainEnv(peak, dur, a, instant)), dur + 0.05)
+    }
+
+    /** Port of Fruity's _noise() helper (bandpass by default). */
+    private fun noiseHit(
+        type: BiquadType = BiquadType.BANDPASS, freq: Double, f1: Double? = null, q: Double = 1.0,
+        dur: Double, peak: Double, a: Double = 0.004, instant: Boolean = false, seedSalt: Int = 0,
+    ): Voice {
+        val fp = Param(freq)
+        if (f1 != null) fp.exponentialRampToValueAtTime(f1, dur)
+        val seed = (freq * 7 + dur * 1000).toInt() * 31 + type.ordinal + seedSalt * 1013
+        val flt = BiquadNode(NoiseNode(seed), type, fp, Param(q))
+        return Voice(GainNode(flt, gainEnv(peak, dur, a, instant)), if (instant) dur + 0.1 else dur + 0.05)
+    }
+
+    /** Port of Fruity's _fm() helper (sine carrier, sine modulator, decaying index). */
+    private fun fm(freq: Double, ratio: Double, index: Double, dur: Double, peak: Double, a: Double = 0.005): Voice {
+        val mod = OscNode(Wave.SINE, Param(freq * ratio))
+        val mg = Param(freq * index)
+        mg.setValueAtTime(freq * index, 0.0)
+        mg.exponentialRampToValueAtTime(1.0, dur)
+        val carFreq = Param(freq)
+        carFreq.inputs = listOf(GainNode(mod, mg))
+        val car = OscNode(Wave.SINE, carFreq)
+        return Voice(GainNode(car, gainEnv(peak, dur, a, instant = false)), dur + 0.05)
+    }
+
+    /**
+     * Pluck decay for tab playback: Fruity's fixed recipe decay, stretched
+     * toward the written note duration (long notes ring longer), then
+     * scaled. [capShortened] (palm mute / dead note shaping) hard-caps the
+     * result at 0.35 s; recipe-variant tweaks under 1.0 do not cap.
+     */
+    private fun ringDur(recipeBase: Double, dur: Double, decayScale: Double, capShortened: Boolean = decayScale < 1.0): Double {
+        var d = maxOf(recipeBase, minOf(dur * 0.95, recipeBase * 5))
+        d *= decayScale
+        if (capShortened) d = minOf(d, 0.35)
+        return maxOf(d, 0.03)
+    }
+
+    /** Note duration for the duration-driven bass/keys recipes, with palm/dead shaping applied. */
+    private fun shapedDur(dur: Double, shape: Shape, floor: Double = 0.30): Double {
+        var d = maxOf(dur, floor)
+        if (shape.decayScale < 1.0) d = minOf(d * shape.decayScale, 0.35)
+        return maxOf(d, 0.05)
+    }
+
+    // ---------- Guitar (Fruity pluck family) ----------
+
+    private fun guitarVoice(variant: Int, f: Double, dur: Double, shape: Shape): Voice = when (variant) {
+        0 -> guitarPluckVoice(f, dur, shape, triLp = 2400.0, sawLp = 1800.0, sawPeak = 0.16, noisePeak = 0.18, decayScale = 1.0)
+        1 -> guitarPluckVoice(f, dur, shape, triLp = 1350.0, sawLp = 1050.0, sawPeak = 0.10, noisePeak = 0.08, decayScale = 0.9)
+        2 -> cleanElectricVoice(f, dur, shape)
+        3 -> distortedVoice(f, dur, shape)
+        else -> guitarPluckVoice(f, dur, shape, triLp = 2400.0, sawLp = 1800.0, sawPeak = 0.16, noisePeak = 0.22, decayScale = 0.16)
+    }
+
+    /** Fruity "guitarpluck": triangle body + short saw attack layer + pick noise. */
+    private fun guitarPluckVoice(
+        f: Double, dur: Double, shape: Shape,
+        triLp: Double, sawLp: Double, sawPeak: Double, noisePeak: Double, decayScale: Double,
+    ): Voice {
+        val ds = decayScale * shape.decayScale
+        val fs = shape.filterScale
+        val ring = ringDur(0.52, dur, ds, capShortened = shape.decayScale < 1.0)
+        return sumVoices(
+            tone(Wave.TRIANGLE, f, dur = ring, peak = 0.55, lp = triLp * fs),
+            tone(Wave.SAWTOOTH, f, dur = 0.14 * maxOf(ds, 0.16), peak = sawPeak, lp = sawLp * fs),
+            noiseHit(freq = 1800.0, dur = 0.025, peak = noisePeak * shape.noiseScale),
+        )
+    }
+
+    /** Fruity "pluck" (Lead Pluck): triangle through a closing lowpass, Q 4. */
+    private fun cleanElectricVoice(f: Double, dur: Double, shape: Shape): Voice {
+        val fs = shape.filterScale
+        val fltFreq = Param(3400.0 * fs)
+        fltFreq.exponentialRampToValueAtTime(420.0 * fs, 0.22)
+        val flt = BiquadNode(OscNode(Wave.TRIANGLE, Param(f)), BiquadType.LOWPASS, fltFreq, Param(4.0))
+        return envGainVoice(flt, 0.55, ringDur(0.26, dur, shape.decayScale))
+    }
+
+    /** Fruity "superpluck" detuned saw stack, driven through Fruity's distortion curve (as in "growl"/the tone chain). */
+    private fun distortedVoice(f: Double, dur: Double, shape: Shape): Voice {
+        val fs = shape.filterScale
+        val stack = SumNode(listOf(-9.0, 0.0, 9.0).map { OscNode(Wave.SAWTOOTH, Param(f), it) })
+        val shaper = ShaperNode(stack, distortionCurve(45.0))
+        val fltFreq = Param(3800.0 * fs)
+        fltFreq.exponentialRampToValueAtTime(500.0 * fs, 0.25)
+        val flt = BiquadNode(shaper, BiquadType.LOWPASS, fltFreq, Param(3.0))
+        return envGainVoice(flt, 0.5, ringDur(0.28, dur, shape.decayScale))
+    }
+
+    // ---------- Bass (Fruity bass recipes) ----------
+
+    private fun bassVoice(variant: Int, f: Double, dur: Double, shape: Shape): Voice = when (variant) {
+        0 -> pluckBassVoice(f, dur, shape, startFreq = 1900.0, endFreq = 190.0)
+        1 -> sumVoices(
+            pluckBassVoice(f, dur, shape, startFreq = 3200.0, endFreq = 300.0),
+            noiseHit(freq = 1800.0, dur = 0.02, peak = 0.12 * shape.noiseScale),
+        )
+        2 -> sumVoices(
+            pluckBassVoice(f, dur, shape, startFreq = 2800.0, endFreq = 220.0, durMul = 0.75),
+            tone(Wave.SINE, f * 0.5, f1 = f * 0.25, ft = 0.07, dur = 0.14, peak = 0.5),
+        )
+        3 -> {
+            val d = shapedDur(dur, shape)
+            sumVoices(
+                tone(Wave.TRIANGLE, f, dur = d, peak = 0.55, lp = 1200.0 * shape.filterScale, glideFrom = 0.94),
+                tone(Wave.SINE, f / 2, dur = d, peak = 0.4, glideFrom = 0.94),
+            )
+        }
+        else -> acidBassVoice(f, dur, shape)
+    }
+
+    /** Fruity "pluckbass": triangle through a lowpass sweeping 1900 -> 190 over the note, Q 5. */
+    private fun pluckBassVoice(
+        f: Double, dur: Double, shape: Shape,
+        startFreq: Double, endFreq: Double, durMul: Double = 1.0,
+    ): Voice {
+        val fs = shape.filterScale
+        val d = shapedDur(dur, shape) * durMul
+        val fltFreq = Param(startFreq * fs)
+        fltFreq.exponentialRampToValueAtTime(endFreq * fs, d)
+        val flt = BiquadNode(OscNode(Wave.TRIANGLE, Param(f)), BiquadType.LOWPASS, fltFreq, Param(5.0))
+        return envGainVoice(flt, 0.7, d)
+    }
+
+    /** Fruity "acidbass": sawtooth through a resonant lowpass sweeping 2900 -> 240, Q 13. */
+    private fun acidBassVoice(f: Double, dur: Double, shape: Shape): Voice {
+        val fs = shape.filterScale
+        val d = shapedDur(dur, shape)
+        val fltFreq = Param(2900.0 * fs)
+        fltFreq.exponentialRampToValueAtTime(240.0 * fs, d * 0.8)
+        val flt = BiquadNode(OscNode(Wave.SAWTOOTH, Param(f)), BiquadType.LOWPASS, fltFreq, Param(13.0))
+        val g = Param(1.0)
+        g.setValueAtTime(0.0001, 0.0)
+        g.linearRampToValueAtTime(0.6, 0.01)
+        g.exponentialRampToValueAtTime(0.001, d)
+        return Voice(GainNode(flt, g), d + 0.05)
+    }
+
+    // ---------- Keyboard (Fruity keys recipes) ----------
+
+    private fun keysVoice(variant: Int, f: Double, dur: Double, shape: Shape): Voice = when (variant) {
+        // Fruity "epiano" FM pair; Grand Piano lowers the FM index and stretches the decay.
+        0 -> sumVoices(
+            fm(f, 1.0, 2.2, shapedDur(maxOf(dur * 1.2, 0.6), shape, floor = 0.6), 0.42),
+            fm(f, 14.07, 0.7, 0.18, 0.10),
+        )
+        1 -> sumVoices(
+            fm(f, 1.0, 3.2, shapedDur(dur, shape, floor = 0.6), 0.42),
+            fm(f, 14.07, 0.7, 0.18, 0.10),
+        )
+        2 -> organVoice(f, dur, shape)
+        3 -> sumVoices(
+            fm(f, 3.98, 1.1, maxOf(0.95, minOf(dur, 2.5)), 0.28),
+            tone(Wave.SINE, f * 2, dur = 0.3, peak = 0.06),
+        )
+        else -> synthLeadVoice(f, dur, shape)
+    }
+
+    /** Fruity "organ" (Drawbar Organ): four sine partials (1x/2x/3x/4x) under a hold-and-release gain. */
+    private fun organVoice(f: Double, dur: Double, shape: Shape): Voice {
+        val d = shapedDur(dur, shape)
+        val g = Param(1.0)
+        g.setValueAtTime(0.0001, 0.0)
+        g.linearRampToValueAtTime(0.3, 0.015)
+        g.setValueAtTime(0.3, maxOf(0.02, d - 0.08))
+        g.exponentialRampToValueAtTime(0.001, d)
+        val partials = listOf(1.0 to 0.5, 2.0 to 0.32, 3.0 to 0.2, 4.0 to 0.13)
+        val sum = SumNode(partials.map { (m, a) -> GainNode(OscNode(Wave.SINE, Param(f * m)), Param(a)) })
+        return Voice(GainNode(sum, g), d + 0.05)
+    }
+
+    /** Fruity "squarelead": square wave with a 5.2 Hz vibrato LFO through a 2900 Hz lowpass. */
+    private fun synthLeadVoice(f: Double, dur: Double, shape: Shape): Voice {
+        val d = shapedDur(dur, shape)
+        val lfoAmt = GainNode(OscNode(Wave.SINE, Param(5.2)), Param(7.0))
+        val freqP = Param(f)
+        freqP.inputs = listOf(lfoAmt)
+        val osc = OscNode(Wave.SQUARE, freqP)
+        val flt = BiquadNode(osc, BiquadType.LOWPASS, Param(2900.0 * shape.filterScale), Param(1.0))
+        val g = Param(1.0)
+        g.setValueAtTime(0.0001, 0.0)
+        g.linearRampToValueAtTime(0.32, 0.02)
+        g.exponentialRampToValueAtTime(0.001, d)
+        return Voice(GainNode(flt, g), d + 0.05)
+    }
+
+    // ---------- Drums (Fruity drum recipes, GM-mapped) ----------
+
+    private enum class DrumPiece { KICK, SNARE, CLAP, HAT_CLOSED, HAT_OPEN, TOM, CRASH, RIDE, COWBELL, SHAKER, STICK, UNKNOWN }
 
     private fun pieceFor(pitch: Int): DrumPiece = when (pitch) {
         35, 36 -> DrumPiece.KICK
         38, 40 -> DrumPiece.SNARE
+        37 -> DrumPiece.STICK
         39 -> DrumPiece.CLAP
         42, 44 -> DrumPiece.HAT_CLOSED
         46 -> DrumPiece.HAT_OPEN
@@ -343,108 +406,169 @@ object Synth {
     }
 
     fun renderDrum(kit: Int, pitch: Int, gain: Float): FloatArray {
-        val piece = pieceFor(pitch)
-        val sr = SAMPLE_RATE
-        // Kit character: [brightness, punch, decayScale, electronic]
-        val (bright, punch, decayScale, electronic) = when (kit) {
-            0 -> listOf(1.0, 1.0, 1.0, 0.0)   // Rock
-            1 -> listOf(0.8, 0.8, 0.85, 0.0)  // Pop
-            2 -> listOf(1.2, 1.1, 0.9, 1.0)   // Electronic
-            3 -> listOf(0.6, 0.6, 1.2, 0.0)   // Jazz
-            else -> listOf(0.5, 0.9, 0.7, 0.3) // Lo-Fi
-        }
-        val buf = when (piece) {
-            DrumPiece.KICK -> renderToneBurst(
-                if (electronic > 0.5) 120.0 else 150.0, 0.24 * decayScale, gain * punch.toFloat(),
-                sweepTo = 40.0, noise = 0.15 * bright)
-            DrumPiece.SNARE -> {
-                val tone = renderToneBurst(190.0, 0.09 * decayScale, gain * 0.5f, sweepTo = 120.0)
-                val noise = renderNoiseBurst(0.16 * decayScale, gain * 0.7f * punch.toFloat(), highpass = bright > 0.7)
-                mix(tone, noise)
-            }
-            DrumPiece.CLAP -> renderNoiseBurst(0.22 * decayScale, gain * 0.8f, highpass = true, repeats = 3)
-            DrumPiece.HAT_CLOSED -> renderNoiseBurst(0.05 * decayScale, gain * 0.5f, highpass = true, metallic = true)
-            DrumPiece.HAT_OPEN -> renderNoiseBurst(0.35 * decayScale, gain * 0.5f, highpass = true, metallic = true)
-            DrumPiece.TOM -> {
-                val f = when (pitch) { 41, 43 -> 100.0; 45, 47 -> 130.0; 48 -> 165.0; else -> 190.0 }
-                renderToneBurst(f, 0.28 * decayScale, gain * 0.9f, sweepTo = f * 0.6)
-            }
-            DrumPiece.CRASH -> renderNoiseBurst(1.1 * decayScale, gain * 0.55f, highpass = true, metallic = true)
-            DrumPiece.RIDE -> renderNoiseBurst(0.5 * decayScale, gain * 0.4f, highpass = true, metallic = true)
-            DrumPiece.COWBELL -> {
-                val n = (0.25 * sr).toInt()
-                val out = FloatArray(n)
-                for (i in 0 until n) {
-                    val t = i.toDouble() / sr
-                    val s = sin(2 * PI * 540 * t) * 0.6 + sin(2 * PI * 800 * t) * 0.4
-                    out[i] = (s * exp(-t * 14) * gain).toFloat()
-                }
-                out
-            }
-            DrumPiece.SHAKER -> renderNoiseBurst(0.12 * decayScale, gain * 0.45f, highpass = false)
-            DrumPiece.UNKNOWN -> renderNoiseBurst(0.1, gain * 0.5f, highpass = true)
-        }
-        if (kit == 4) lofiCrush(buf)
+        val voice = drumVoice(kit, pieceFor(pitch), pitch)
+        val n = (voice.seconds * SAMPLE_RATE).toInt().coerceAtLeast(256)
+        val buf = voice.node.render(n, SAMPLE_RATE)
+        if (kit == 4) shapeBuffer(buf, crushCurve(5)) // Lo-Fi kit runs through Fruity's crush curve
+        microFades(buf, 0.0)
         // Keep every hit at a known ceiling so kit pieces can't stack into clipping.
         return normalize(buf, 0.85f * (gain / 0.9f).coerceIn(0.15f, 1f))
     }
 
-    private fun renderToneBurst(freq: Double, seconds: Double, gain: Float, sweepTo: Double, noise: Double = 0.0): FloatArray {
-        val sr = SAMPLE_RATE
-        val n = (seconds * sr).toInt().coerceAtLeast(64)
-        val out = FloatArray(n)
-        var phase = 0.0
-        val rnd = Random(42)
-        for (i in 0 until n) {
-            val t = i.toDouble() / sr
-            val k = t / seconds
-            val f = sweepTo + (freq - sweepTo) * exp(-k * 9.0)
-            phase += 2 * PI * f / sr
-            var s = sin(phase) * exp(-k * 4.5)
-            if (noise > 0) s += (rnd.nextFloat() * 2 - 1) * noise * exp(-k * 30.0)
-            out[i] = (s * gain).toFloat()
+    private fun drumVoice(kit: Int, piece: DrumPiece, pitch: Int): Voice = when (piece) {
+        DrumPiece.KICK -> when (kit) {
+            2 -> sumVoices( // Fruity "kick2" (Electro Kick)
+                tone(Wave.SINE, 162.0, f1 = 58.0, ft = 0.09, dur = 0.3, peak = 0.95),
+                tone(Wave.TRIANGLE, 820.0, dur = 0.018, peak = 0.35),
+            )
+            3 -> sumVoices( // Fruity "deepkick"
+                tone(Wave.SINE, 118.0, f1 = 36.0, ft = 0.14, dur = 0.42, peak = 1.0),
+                noiseHit(BiquadType.HIGHPASS, 3000.0, dur = 0.02, peak = 0.25),
+            )
+            4 -> sumVoices( // Fruity "lofikick"
+                tone(Wave.SINE, 120.0, f1 = 45.0, ft = 0.1, dur = 0.3, peak = 0.9, lp = 900.0),
+                noiseHit(BiquadType.LOWPASS, 2400.0, dur = 0.05, peak = 0.12),
+            )
+            else -> { // Fruity "kick"
+                val freq = Param(155.0)
+                freq.exponentialRampToValueAtTime(42.0, 0.11)
+                envGainVoice(OscNode(Wave.SINE, freq), 1.0, 0.27)
+            }
         }
-        return out
+        DrumPiece.SNARE -> when (kit) {
+            1, 4 -> sumVoices( // Fruity "snare2" (tight)
+                noiseHit(BiquadType.BANDPASS, 2400.0, q = 0.7, dur = 0.11, peak = 0.65),
+                tone(Wave.TRIANGLE, 242.0, f1 = 170.0, ft = 0.05, dur = 0.07, peak = 0.4),
+            )
+            2 -> sumVoices( // Fruity "noisesnare"
+                noiseHit(BiquadType.BANDPASS, 1000.0, f1 = 3200.0, q = 0.6, dur = 0.3, peak = 0.6),
+                noiseHit(BiquadType.HIGHPASS, 6000.0, dur = 0.18, peak = 0.3),
+            )
+            3 -> sumVoices( // Fruity "brushsnare"
+                noiseHit(BiquadType.BANDPASS, 3200.0, f1 = 1400.0, q = 0.6, dur = 0.34, peak = 0.5, a = 0.05),
+                tone(Wave.TRIANGLE, 210.0, dur = 0.06, peak = 0.2),
+            )
+            else -> sumVoices( // Fruity "snare"
+                noiseHit(BiquadType.BANDPASS, 1800.0, q = 0.8, dur = 0.16, peak = 0.7, instant = true),
+                tone(Wave.TRIANGLE, 192.0, dur = 0.09, peak = 0.45, instant = true),
+            )
+        }
+        DrumPiece.CLAP -> when (kit) {
+            1, 4 -> sumVoices( // Fruity "clapstack": four bandpassed noise bursts
+                noiseHit(BiquadType.BANDPASS, 1300.0, q = 1.8, dur = 0.07, peak = 0.5),
+                noiseHit(BiquadType.BANDPASS, 1300.0, q = 1.8, dur = 0.07, peak = 0.5, seedSalt = 1).delayed(0.03),
+                noiseHit(BiquadType.BANDPASS, 1300.0, q = 1.8, dur = 0.07, peak = 0.5, seedSalt = 2).delayed(0.07),
+                noiseHit(BiquadType.BANDPASS, 1300.0, q = 1.8, dur = 0.3, peak = 0.5, seedSalt = 3).delayed(0.12),
+            )
+            else -> clapVoice() // Fruity "clap": three pulses + tail through a 1200 Hz bandpass
+        }
+        DrumPiece.HAT_CLOSED -> when (kit) {
+            2 -> sumVoices( // Fruity "pedalhat"
+                noiseHit(BiquadType.HIGHPASS, 9200.0, dur = 0.035, peak = 0.3),
+                tone(Wave.SQUARE, 10400.0, dur = 0.02, peak = 0.08),
+            )
+            3 -> hatVoice(open = false, hpFreq = 8200.0, peakScale = 0.7)
+            4 -> hatVoice(open = false, hpFreq = 6000.0, peakScale = 1.0)
+            else -> hatVoice(open = false, hpFreq = 8200.0, peakScale = 1.0) // Fruity "hat"
+        }
+        DrumPiece.HAT_OPEN -> when (kit) {
+            3 -> hatVoice(open = true, hpFreq = 7600.0, peakScale = 0.8)
+            4 -> hatVoice(open = true, hpFreq = 6000.0, peakScale = 1.0)
+            else -> hatVoice(open = true, hpFreq = 7600.0, peakScale = 1.0) // Fruity "openhat"
+        }
+        DrumPiece.TOM -> {
+            val mul = when (pitch) {
+                41 -> 0.55; 43 -> 0.62; 45 -> 0.72; 47 -> 0.82; 48 -> 0.90; 50 -> 1.0
+                else -> 0.8
+            }
+            if (kit == 2) { // Fruity "electrotom", scaled by tom pitch
+                sumVoices(
+                    tone(Wave.SQUARE, 302.0 * mul, f1 = 88.0 * mul, ft = 0.22, dur = 0.32, peak = 0.4, lp = 1600.0),
+                    tone(Wave.SINE, 302.0 * mul, f1 = 88.0 * mul, ft = 0.22, dur = 0.32, peak = 0.4),
+                )
+            } else { // Fruity "tom"
+                tone(Wave.SINE, 196.0 * mul, f1 = 88.0 * mul, ft = 0.18, dur = 0.26, peak = 0.8, instant = true)
+            }
+        }
+        DrumPiece.CRASH -> sumVoices( // Fruity "crash": two highpassed noise layers
+            noiseHit(BiquadType.HIGHPASS, 5800.0, dur = 1.25, peak = 0.5, instant = true),
+            noiseHit(BiquadType.HIGHPASS, 9500.0, dur = 0.7, peak = 0.22, instant = true),
+        )
+        DrumPiece.RIDE -> sumVoices(
+            // Fruity has no ride recipe; approximated from its "tambourine"
+            // metallic partials over a highpassed noise wash (documented).
+            noiseHit(BiquadType.HIGHPASS, 7600.0, dur = 0.5, peak = 0.28),
+            tone(Wave.SQUARE, 5230.0, dur = 0.3, peak = 0.04),
+            tone(Wave.SQUARE, 6640.0, dur = 0.25, peak = 0.03),
+        )
+        DrumPiece.COWBELL -> { // Fruity "cowbell": two squares through a 720 Hz bandpass
+            val bp = BiquadNode(
+                SumNode(listOf(OscNode(Wave.SQUARE, Param(540.0)), OscNode(Wave.SQUARE, Param(845.0)))),
+                BiquadType.BANDPASS, Param(720.0), Param(1.1),
+            )
+            envGainVoice(bp, 0.5, 0.26)
+        }
+        DrumPiece.SHAKER -> if (pitch == 69) {
+            noiseHit(BiquadType.HIGHPASS, 6200.0, dur = 0.07, peak = 0.42)
+        } else { // Fruity "shaker": two hits
+            sumVoices(
+                noiseHit(BiquadType.HIGHPASS, 6200.0, dur = 0.07, peak = 0.42),
+                noiseHit(BiquadType.HIGHPASS, 6200.0, dur = 0.07, peak = 0.3, seedSalt = 1).delayed(0.085),
+            )
+        }
+        DrumPiece.STICK -> sumVoices( // Fruity "stick" (Cross Stick)
+            tone(Wave.SQUARE, 905.0, dur = 0.032, peak = 0.42),
+            noiseHit(BiquadType.HIGHPASS, 5000.0, dur = 0.02, peak = 0.2),
+        )
+        DrumPiece.UNKNOWN -> noiseHit(BiquadType.HIGHPASS, 4000.0, dur = 0.1, peak = 0.4)
     }
 
-    private fun renderNoiseBurst(seconds: Double, gain: Float, highpass: Boolean,
-                                 metallic: Boolean = false, repeats: Int = 1): FloatArray {
-        val sr = SAMPLE_RATE
-        val n = (seconds * sr).toInt().coerceAtLeast(64)
-        val out = FloatArray(n)
-        val rnd = Random(seconds.hashCode() * 31 + repeats)
-        var prev = 0f
-        var hpPrevIn = 0f; var hpPrevOut = 0f
-        for (i in 0 until n) {
-            val t = i.toDouble() / sr
-            var w = rnd.nextFloat() * 2f - 1f
-            if (metallic) {
-                // Cheap metallic sheen: ring-modulate noise with a high square-ish tone.
-                val m = if (sin(2 * PI * 6200 * t) > 0) 1f else -0.6f
-                w *= m
-            }
-            var s = w
-            if (highpass) {
-                val a = 0.72f
-                val o = a * (hpPrevOut + w - hpPrevIn)
-                hpPrevIn = w; hpPrevOut = o
-                s = o
-            } else {
-                s = (w + prev) * 0.5f
-                prev = w
-            }
-            var env = exp(-t * (if (metallic) 9.0 else 16.0) / maxOf(seconds, 0.05) * 0.35)
-            if (repeats > 1) {
-                val seg = seconds / repeats
-                val local = (t % seg) / seg
-                env = exp(-local * 3.0) * (0.5 + 0.5 * ((t / seg).toInt() + 1) / repeats)
-            }
-            out[i] = (s * env * gain).toFloat()
+    /** Fruity "hat"/"openhat": highpassed noise under an envGain decay. */
+    private fun hatVoice(open: Boolean, hpFreq: Double, peakScale: Double): Voice =
+        noiseHit(
+            BiquadType.HIGHPASS, hpFreq,
+            dur = if (open) 0.42 else 0.05,
+            peak = (if (open) 0.4 else 0.42) * peakScale,
+            instant = true,
+        )
+
+    /** Fruity "clap": bandpassed noise with three attack pulses and a tail, via raw gain automation. */
+    private fun clapVoice(): Voice {
+        val bp = BiquadNode(NoiseNode(1237), BiquadType.BANDPASS, Param(1200.0), Param(1.6))
+        val g = Param(1.0)
+        g.setValueAtTime(0.0, 0.0)
+        for (off in listOf(0.0, 0.021, 0.042)) {
+            g.setValueAtTime(0.85, off)
+            g.exponentialRampToValueAtTime(0.25, off + 0.018)
         }
-        return out
+        g.setValueAtTime(0.85, 0.063)
+        g.exponentialRampToValueAtTime(0.001, 0.32)
+        return Voice(GainNode(bp, g), 0.36)
     }
 
     // ---------- Shared helpers ----------
+
+    /** Short fade at both ends of a rendered note so note boundaries never click. */
+    private fun microFades(buf: FloatArray, attackSec: Double) {
+        val fadeIn = maxOf(24, (attackSec * SAMPLE_RATE).toInt()).coerceAtMost(buf.size / 2)
+        for (i in 0 until fadeIn) buf[i] *= i.toFloat() / fadeIn
+        val fadeOut = minOf(256, buf.size / 6)
+        for (i in 0 until fadeOut) {
+            val idx = buf.size - 1 - i
+            buf[idx] *= i.toFloat() / fadeOut
+        }
+    }
+
+    private fun shapeBuffer(buf: FloatArray, curve: FloatArray) {
+        val m = curve.size - 1
+        for (i in buf.indices) {
+            val x = buf[i].coerceIn(-1f, 1f)
+            val pos = (x + 1f) * 0.5f * m
+            val i0 = pos.toInt().coerceIn(0, m - 1)
+            val frac = pos - i0
+            buf[i] = curve[i0] + (curve[i0 + 1] - curve[i0]) * frac
+        }
+    }
 
     /** Resample [buf] with a time-varying rate to impose bend/slide/vibrato pitch contours. */
     private fun applyPitchContour(buf: FloatArray, fx: FxSpec, nominalDurSec: Double): FloatArray {
@@ -518,25 +642,5 @@ object Synth {
             for (i in buf.indices) buf[i] *= k
         }
         return buf
-    }
-
-    private fun mix(a: FloatArray, b: FloatArray): FloatArray {
-        val out = FloatArray(maxOf(a.size, b.size))
-        for (i in out.indices) {
-            out[i] = (if (i < a.size) a[i] else 0f) + (if (i < b.size) b[i] else 0f)
-        }
-        return out
-    }
-
-    private fun mixInto(target: FloatArray, extra: FloatArray) {
-        for (i in extra.indices) if (i < target.size) target[i] += extra[i]
-    }
-
-    private fun lofiCrush(buf: FloatArray) {
-        var hold = 0f
-        for (i in buf.indices) {
-            if (i % 3 == 0) hold = buf[i]
-            buf[i] = hold * 0.9f
-        }
     }
 }
